@@ -3,7 +3,10 @@ package com.example.thanos
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.CalendarContract
+import android.provider.ContactsContract
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -51,7 +54,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     val liste = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val phrase = liste?.firstOrNull() ?: return
                     texte.text = "Tu as dit : $phrase"
-                    tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+                    executer(phrase)
                 }
                 override fun onError(error: Int) {
                     texte.text = "Je n'ai pas compris (erreur $error). Réessaie."
@@ -76,8 +79,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun ecouter() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS), 1)
             return
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -86,6 +91,65 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
         recognizer?.startListening(intent)
+    }
+
+    private fun dire(m: String) {
+        texte.text = m
+        tts.speak(m, TextToSpeech.QUEUE_FLUSH, null, "thanos")
+    }
+
+    private fun executer(phrase: String) {
+        val p = phrase.lowercase(Locale.FRANCE).trim()
+        when {
+            p.contains("agenda") || p.contains("calendrier") -> {
+                dire("J'ouvre l'agenda")
+                val uri = CalendarContract.CONTENT_URI.buildUpon().appendPath("time").build()
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+            }
+            p.startsWith("appelle ") -> {
+                val nom = p.removePrefix("appelle ").trim()
+                val numero = chercherNumero(nom)
+                if (numero != null) {
+                    dire("J'appelle $nom")
+                    startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$numero")))
+                } else {
+                    dire("Je ne trouve pas $nom dans tes contacts")
+                }
+            }
+            p.startsWith("ouvre ") -> {
+                val nom = p.removePrefix("ouvre ").trim()
+                val pm = packageManager
+                val apps = pm.queryIntentActivities(
+                    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                val trouve = apps.firstOrNull {
+                    it.loadLabel(pm).toString().lowercase().contains(nom)
+                }
+                val lancer = trouve?.let {
+                    pm.getLaunchIntentForPackage(it.activityInfo.packageName)
+                }
+                if (lancer != null) {
+                    dire("J'ouvre $nom")
+                    startActivity(lancer)
+                } else {
+                    dire("Je ne trouve pas l'application $nom")
+                }
+            }
+            else -> dire(phrase)
+        }
+    }
+
+    private fun chercherNumero(nom: String): String? {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+        val phone = ContactsContract.CommonDataKinds.Phone
+        val c = contentResolver.query(
+            phone.CONTENT_URI,
+            arrayOf(phone.NUMBER),
+            "${phone.DISPLAY_NAME} LIKE ?",
+            arrayOf("%$nom%"),
+            null
+        )
+        c?.use { if (it.moveToFirst()) return it.getString(0) }
+        return null
     }
 
     override fun onDestroy() {
