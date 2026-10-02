@@ -5,6 +5,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.speech.RecognitionListener
@@ -12,6 +14,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.view.Gravity
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -23,18 +26,22 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var tts: TextToSpeech
     private var recognizer: SpeechRecognizer? = null
     private lateinit var texte: TextView
+    private lateinit var bouton: Button
+    private val handler = Handler(Looper.getMainLooper())
+    private var actif = false
+    private var attendCommande = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         texte = TextView(this).apply {
-            text = "Appuie sur le bouton et parle"
+            text = "Appuie sur le bouton pour activer Thanos"
             textSize = 20f
             gravity = Gravity.CENTER
         }
-        val bouton = Button(this).apply {
-            text = "🎤 Parler"
-            setOnClickListener { ecouter() }
+        bouton = Button(this).apply {
+            text = "🎤 Activer Thanos"
+            setOnClickListener { if (actif) arreter() else demarrer() }
         }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -52,14 +59,21 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             recognizer?.setRecognitionListener(object : RecognitionListener {
                 override fun onResults(results: Bundle?) {
                     val liste = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val phrase = liste?.firstOrNull() ?: return
-                    texte.text = "Tu as dit : $phrase"
-                    executer(phrase)
+                    val phrase = liste?.firstOrNull()
+                    if (phrase == null) {
+                        relancer(300)
+                    } else {
+                        traiter(phrase)
+                    }
                 }
                 override fun onError(error: Int) {
-                    texte.text = "Je n'ai pas compris (erreur $error). Réessaie."
+                    if (attendCommande) {
+                        attendCommande = false
+                        if (actif) texte.text = "Je repasse en veille. Dis « Thanos »"
+                    }
+                    relancer(if (error == 8) 1000 else 400)
                 }
-                override fun onReadyForSpeech(params: Bundle?) { texte.text = "Je t'écoute..." }
+                override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
@@ -78,7 +92,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun ecouter() {
+    private fun demarrer() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
             checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED ||
             checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
@@ -90,12 +104,67 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 ), 1)
             return
         }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        actif = true
+        attendCommande = false
+        bouton.text = "⏹ Arrêter Thanos"
+        texte.text = "Je t'écoute. Dis « Thanos »"
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        relancer(0)
+    }
+
+    private fun arreter() {
+        actif = false
+        attendCommande = false
+        handler.removeCallbacksAndMessages(null)
+        recognizer?.cancel()
+        bouton.text = "🎤 Activer Thanos"
+        texte.text = "Thanos est en pause"
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun relancer(delai: Long) {
+        handler.postDelayed({
+            if (!actif) return@postDelayed
+            if (tts.isSpeaking) {
+                relancer(500)
+                return@postDelayed
+            }
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            }
+            recognizer?.startListening(intent)
+        }, delai)
+    }
+
+    private fun traiter(phrase: String) {
+        if (attendCommande) {
+            attendCommande = false
+            texte.text = "Tu as dit : $phrase"
+            executer(phrase)
+            relancer(1500)
+            return
         }
-        recognizer?.startListening(intent)
+        val p = phrase.lowercase(Locale.FRANCE).trim()
+        var reste: String? = null
+        for (m in listOf("thanos", "tanos", "tannos")) {
+            val i = p.indexOf(m)
+            if (i >= 0) {
+                reste = p.substring(i + m.length).trim(' ', ',', '.')
+                break
+            }
+        }
+        if (reste == null) {
+            relancer(300)
+        } else if (reste.isEmpty()) {
+            attendCommande = true
+            dire("Oui ?")
+            relancer(1200)
+        } else {
+            executer(reste)
+            relancer(1500)
+        }
     }
 
     private fun dire(m: String) {
@@ -166,6 +235,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         recognizer?.destroy()
         tts.shutdown()
         super.onDestroy()
