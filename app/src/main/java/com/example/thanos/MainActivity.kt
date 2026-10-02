@@ -80,9 +80,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private fun ecouter() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
-            checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(
-                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS), 1)
+                arrayOf(
+                    Manifest.permission.RECORD_AUDIO,
+                    Manifest.permission.READ_CONTACTS,
+                    Manifest.permission.CALL_PHONE
+                ), 1)
             return
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -111,7 +116,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 val numero = chercherNumero(nom)
                 if (numero != null) {
                     dire("J'appelle $nom")
-                    startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$numero")))
+                    val action =
+                        if (checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
+                            Intent.ACTION_CALL else Intent.ACTION_DIAL
+                    startActivity(Intent(action, Uri.parse("tel:" + Uri.encode(numero))))
                 } else {
                     dire("Je ne trouve pas $nom dans tes contacts")
                 }
