@@ -140,16 +140,21 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private fun chercherNumero(nom: String): String? {
         if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
-        val phone = ContactsContract.CommonDataKinds.Phone
-        val c = contentResolver.query(
-            phone.CONTENT_URI,
-            arrayOf(phone.NUMBER),
-            "${phone.DISPLAY_NAME} LIKE ?",
-            arrayOf("%$nom%"),
+        val curseur = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+            arrayOf("%" + nom + "%"),
             null
         )
-        c?.use { if (it.moveToFirst()) return it.getString(0) }
-        return null
+        var resultat: String? = null
+        if (curseur != null) {
+            if (curseur.moveToFirst()) {
+                resultat = curseur.getString(0)
+            }
+            curseur.close()
+        }
+        return resultat
     }
 
     override fun onDestroy() {
