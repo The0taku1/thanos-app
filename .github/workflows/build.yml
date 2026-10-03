@@ -12,7 +12,9 @@ jobs:
           distribution: temurin
           java-version: 21
       - run: chmod +x gradlew
-      - run: ./gradlew assembleDebug
+      - name: Build
+        run: |
+          ./gradlew assembleDebug --console=plain > build.log 2>&1 || { echo "=== ERREURS ==="; grep -n -E "^e: |What went wrong|Could not|error:|FAILURE" -A4 build.log | head -60; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: thanos-apk
