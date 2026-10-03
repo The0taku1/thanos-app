@@ -20,6 +20,7 @@ import android.provider.ContactsContract
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telecom.TelecomManager
+import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.LibVosk
 import org.vosk.LogLevel
@@ -47,6 +48,14 @@ class ThanosService : Service(), RecognitionListener, TextToSpeech.OnInitListene
     private var charge = false
     private var attendCommande = false
     private val handler = Handler(Looper.getMainLooper())
+    private val historique = mutableListOf<Pair<String, String>>()
+
+    private val personnalite =
+        "Tu es Thanos, l'assistant vocal personnel d'une utilisatrice francophone. " +
+        "Ton style est celui de Jarvis dans Iron Man : poli, dévoué, calme et légèrement pince-sans-rire. " +
+        "Tu tutoies l'utilisatrice. Tes réponses sont lues à voix haute : écris une à trois phrases courtes, " +
+        "sans markdown, sans listes, sans émojis. " +
+        "Si on te demande une information très récente que tu ne peux pas vérifier, dis-le honnêtement."
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -259,6 +268,70 @@ class ThanosService : Service(), RecognitionListener, TextToSpeech.OnInitListene
         }
     }
 
+    // ---------- Cerveau Gemini ----------
+
+    private fun demanderGemini(question: String) {
+        val cle = getSharedPreferences("thanos", MODE_PRIVATE).getString("cle", "") ?: ""
+        if (cle.isBlank()) {
+            dire("Il me faut une clé Gemini. Ouvre l'application pour la saisir.")
+            return
+        }
+        Thread {
+            var reponse: String
+            try {
+                val contenu = JSONArray()
+                for (h in historique.takeLast(6)) {
+                    contenu.put(
+                        JSONObject().put("role", h.first).put(
+                            "parts", JSONArray().put(JSONObject().put("text", h.second))))
+                }
+                contenu.put(
+                    JSONObject().put("role", "user").put(
+                        "parts", JSONArray().put(JSONObject().put("text", question))))
+                val corps = JSONObject()
+                    .put("system_instruction", JSONObject().put(
+                        "parts", JSONArray().put(JSONObject().put("text", personnalite))))
+                    .put("contents", contenu)
+                    .put("generationConfig", JSONObject().put("maxOutputTokens", 1000))
+
+                val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
+                    .openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.setRequestProperty("Content-Type", "application/json")
+                c.setRequestProperty("x-goog-api-key", cle)
+                c.connectTimeout = 15000
+                c.readTimeout = 30000
+                c.doOutput = true
+                c.outputStream.use { it.write(corps.toString().toByteArray(Charsets.UTF_8)) }
+
+                val code = c.responseCode
+                val flux = if (code in 200..299) c.inputStream else c.errorStream
+                val corpsReponse = flux?.bufferedReader()?.readText() ?: ""
+                if (code in 200..299) {
+                    val parts = JSONObject(corpsReponse).getJSONArray("candidates")
+                        .getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+                    val sb = StringBuilder()
+                    for (i in 0 until parts.length()) {
+                        sb.append(parts.getJSONObject(i).optString("text"))
+                    }
+                    reponse = sb.toString().replace("*", "").replace("#", "").trim()
+                    if (reponse.isEmpty()) reponse = "Je n'ai pas de réponse à cela."
+                    historique.add(Pair("user", question))
+                    historique.add(Pair("model", reponse))
+                } else if (code == 429) {
+                    reponse = "J'ai atteint ma limite gratuite. Réessaie dans une minute."
+                } else if (code == 400 || code == 401 || code == 403) {
+                    reponse = "Ta clé Gemini semble invalide. Vérifie-la dans l'application."
+                } else {
+                    reponse = "Gemini a renvoyé l'erreur $code."
+                }
+            } catch (e: Exception) {
+                reponse = "Je n'arrive pas à joindre Gemini. Vérifie ta connexion internet."
+            }
+            handler.post { dire(reponse) }
+        }.start()
+    }
+
     // ---------- Actions ----------
 
     private fun dire(m: String) {
@@ -327,7 +400,7 @@ class ThanosService : Service(), RecognitionListener, TextToSpeech.OnInitListene
                     dire("Je ne trouve pas l'application $nom")
                 }
             }
-            else -> dire("Je n'ai pas compris cette commande")
+            else -> demanderGemini(p)
         }
     }
 
