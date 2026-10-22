@@ -69,6 +69,12 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private val handler = Handler(Looper.getMainLooper())
     private val historique = mutableListOf<Pair<String, String>>()
     private val finFenetre = Runnable { attendCommande = false }
+    private var geminiEnAttente: String? = null
+    private val lancerGeminiDiffere = Runnable {
+        val q = geminiEnAttente
+        geminiEnAttente = null
+        if (q != null) demanderGemini(q)
+    }
 
     private val personnalite =
         "Tu es Thanos, l'assistant vocal personnel d'une utilisatrice francophone. " +
@@ -121,10 +127,10 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                     enPause = true
                 }
                 override fun onDone(utteranceId: String?) {
-                    handler.postDelayed({ enPause = false }, 400)
+                    handler.postDelayed({ enPause = false }, 250)
                 }
                 override fun onError(utteranceId: String?) {
-                    handler.postDelayed({ enPause = false }, 400)
+                    handler.postDelayed({ enPause = false }, 250)
                 }
             })
             ttsPret = true
@@ -362,7 +368,9 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private fun estMotActivation(mot: String): Boolean {
         val s = mot.replace("h", "")
         if (s == "tanos") return true
-        return s.length in 5..6 && s.startsWith("t") && distance(s, "tanos") <= 1
+        if (s.length !in 5..6) return false
+        if (!s.startsWith("t") && !s.startsWith("d")) return false
+        return distance(s, "tanos") <= 1
     }
 
     private fun traiter(texte: String) {
@@ -373,6 +381,20 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             attendCommande = false
             handler.removeCallbacks(finFenetre)
             executer(p)
+            return
+        }
+        // Question Gemini en cours d'assemblage : on complète avec la suite entendue
+        // (le détecteur de fin de phrase coupe parfois les longues phrases en deux).
+        val enCours = geminiEnAttente
+        if (enCours != null) {
+            val suite = p.split(" ").filter { it.isNotEmpty() && !estMotActivation(it) }
+                .joinToString(" ")
+            if (suite.isNotBlank()) {
+                geminiEnAttente = enCours + " " + suite
+                majNotif("J'assemble la question : $geminiEnAttente")
+                handler.removeCallbacks(lancerGeminiDiffere)
+                handler.postDelayed(lancerGeminiDiffere, 2500)
+            }
             return
         }
         val mots = p.split(" ").filter { it.isNotEmpty() }
@@ -449,7 +471,20 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 else -> Rep(Statut.CLE, "Gemini a renvoyé l'erreur $code.")
             }
         } catch (e: Exception) {
-            return Rep(Statut.RESEAU, "Je n'arrive pas à joindre Gemini. Vérifie ta connexion internet.")
+            val detail = e.javaClass.simpleName + " : " + (e.message ?: "inconnue")
+            majNotif("Gemini — $detail")
+            val cause = when (e) {
+                is java.net.UnknownHostException ->
+                    "Je ne trouve pas le serveur Gemini. Le réseau interdit peut-être l'accès à Google."
+                is java.net.SocketTimeoutException ->
+                    "Gemini met trop de temps à répondre, réessaie dans un instant."
+                is javax.net.ssl.SSLException ->
+                    "Connexion sécurisée refusée : vérifie la date et l'heure de ton téléphone."
+                else ->
+                    "Je n'arrive pas à joindre Gemini : " + (e.message ?: "erreur inconnue") +
+                    ". Vérifie ta connexion."
+            }
+            return Rep(Statut.RESEAU, cause)
         }
     }
 
@@ -651,9 +686,20 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             }
             dire("Je ferme $nom")
             handler.postDelayed({
-                val ok = ThanosAccessibility.cliquerForceArret()
-                majNotif(if (ok) "$nom est fermé" else "Touche « Forcer l'arrêt » pour fermer $nom")
-            }, 1200)
+                if (ThanosAccessibility.cliquerForceArret()) {
+                    majNotif("$nom est fermé")
+                    handler.postDelayed({ allerAccueilSilencieux() }, 600)
+                } else {
+                    // Certains téléphones affichent la page un peu lentement : on réessaie.
+                    handler.postDelayed({
+                        val ok = ThanosAccessibility.cliquerForceArret()
+                        majNotif(
+                            if (ok) "$nom est fermé"
+                            else "Touche « Forcer l'arrêt » pour fermer $nom")
+                        if (ok) handler.postDelayed({ allerAccueilSilencieux() }, 600)
+                    }, 800)
+                }
+            }, 1400)
         } else {
             dire("Ouvre les informations de $nom et touche Forcer l'arrêt. " +
                 "Tu peux aussi activer la fermeture automatique dans l'application.")
@@ -664,14 +710,35 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private fun appliAudio(): AudioManager =
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    private fun allerAccueilSilencieux(): Boolean = try {
+        startActivity(Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_HOME)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun allerAccueil() {
+        if (allerAccueilSilencieux()) dire("À l'accueil")
+        else dire("Je ne peux pas revenir à l'accueil")
+    }
+
     private fun executer(p: String) {
         when {
             envoyerEmail(p) -> {}
             envoyerSms(p) -> {}
 
-            p.startsWith("ferme ") || p.startsWith("arrete ") ||
+            p == "ferme" || p == "arrete" || p == "quitte" || p == "stop" ||
+                p.startsWith("ferme ") || p.startsWith("arrete ") ||
                 p.startsWith("quitte ") || p.startsWith("stop ") -> {
-                fermerAppli(p.substringAfter(" ").trim())
+                fermerAppli(p.substringAfter(" ", "").trim())
+            }
+
+            p == "accueil" || p == "home" || p.contains("ecran d accueil") ||
+                p.contains("page d accueil") || p.contains("retour a l accueil") ||
+                p.contains("retourne a l accueil") || p.contains("va a l accueil") -> {
+                allerAccueil()
             }
 
             p.contains("agenda") || p.contains("calendrier") -> {
@@ -779,7 +846,13 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 }
             }
 
-            else -> demanderGemini(p)
+            else -> {
+                // On attend 2,5 s de silence pour réunir d'éventuels morceaux
+                // d'une phrase coupée par le détecteur de fin de phrase.
+                geminiEnAttente = p
+                handler.removeCallbacks(lancerGeminiDiffere)
+                handler.postDelayed(lancerGeminiDiffere, 2500)
+            }
         }
     }
 
