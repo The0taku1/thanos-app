@@ -49,6 +49,14 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        val accessibilite = Button(this).apply {
+            text = "🔓 Fermeture auto des applis"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                texte.text = "Active « Thanos » dans la liste des services d'accessibilité " +
+                    "pour pouvoir fermer des applis à la voix."
+            }
+        }
         val champCle = EditText(this).apply {
             hint = "Colle ta clé Gemini ici"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -70,6 +78,7 @@ class MainActivity : ComponentActivity() {
             addView(activer)
             addView(arreter)
             addView(reglages)
+            addView(accessibilite)
             addView(champCle)
             addView(enregistrer)
         }

@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">THANOS</string>
+    <string name="access_desc">Permet à Thanos de fermer une application à ta demande, quand tu dis « Thanos, ferme WhatsApp ». Thanos ne lit rien et ne clique que sur le bouton « Forcer l’arrêt » de la page que tu viens d’ouvrir.</string>
 </resources>
