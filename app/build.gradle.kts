@@ -19,11 +19,23 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Clé de signature stable : les mises à jour s'installent par-dessus sans
+    // effacer les données de l'application (modèle vocal, clé Gemini).
+    val cleDebug = signingConfigs.maybeCreate("debug").apply {
+        storeFile = file("debug.keystore")
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+    }
+
     buildTypes {
         release {
             optimization {
                 enable = false
             }
+        }
+        named("debug") {
+            signingConfig = cleDebug
         }
     }
     compileOptions {

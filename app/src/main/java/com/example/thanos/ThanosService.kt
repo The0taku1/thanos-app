@@ -85,6 +85,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private val rxEmail = Regex("\\b(?:envoie|ecris|envoyer)\\s+(?:un\\s+)?(?:email|mail|courriel)\\s+a\\s+(.+)$")
     private val rxSms = Regex("\\b(?:envoie|ecris|envoyer)\\s+(?:un\\s+)?(?:sms|texto|message)\\s+a\\s+(.+)$")
     private val rxHeure = Regex("\\b(\\d{1,2})\\s*h\\s*(\\d{0,2})\\b")
+    private var raisonEchec = "Pas de connexion internet"
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -159,10 +160,14 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     // ---------- Réseau ----------
 
     private fun enLigne(): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val reseau = cm.activeNetwork ?: return false
-        return cm.getNetworkCapabilities(reseau)
-            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val reseau = cm.activeNetwork ?: return false
+            cm.getNetworkCapabilities(reseau)
+                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     // ---------- Modèle Vosk ----------
@@ -170,24 +175,42 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private fun preparerModele(): File? {
         val dossier = File(filesDir, "model-fr")
         if (File(dossier, "am").exists()) return dossier
-        try {
-            majNotif("Téléchargement du modèle français (une seule fois)...")
-            val zip = File(cacheDir, "model.zip")
+        var raison: String? = raisonEchec
+        for (essai in 1..3) {
+            majNotif("Téléchargement du modèle français (essai $essai/3)...")
+            raison = telechargerModele(dossier)
+            if (raison == null) return dossier
+            try { Thread.sleep(2000) } catch (e: Exception) { break }
+        }
+        raisonEchec = raison ?: raisonEchec
+        return null
+    }
+
+    // Retourne null en cas de succès, sinon la raison de l'échec.
+    private fun telechargerModele(dossier: File): String? {
+        val zip = File(cacheDir, "model.zip")
+        val temp = File(filesDir, "model-fr.tmp")
+        return try {
             val c = URL("https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip")
                 .openConnection() as HttpURLConnection
             c.connectTimeout = 20000
             c.readTimeout = 60000
+            val code = c.responseCode
+            if (code !in 200..299) {
+                return "Serveur de modèles inaccessible (erreur $code)"
+            }
             c.inputStream.use { entree ->
                 FileOutputStream(zip).use { sortie -> entree.copyTo(sortie) }
             }
-            dossier.deleteRecursively()
-            val racine = dossier.canonicalPath
+            // Extraction dans un dossier temporaire : seul un modèle complet est conservé.
+            temp.deleteRecursively()
+            val racine = temp.canonicalPath
             ZipInputStream(FileInputStream(zip)).use { z ->
                 var e = z.nextEntry
                 while (e != null) {
                     val chemin = e.name.substringAfter("/", "")
                     if (chemin.isNotEmpty()) {
-                        val f = File(dossier, chemin)
+                        val f = File(temp, chemin)
                         if (f.canonicalPath.startsWith(racine)) {
                             if (e.isDirectory) {
                                 f.mkdirs()
@@ -201,16 +224,33 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 }
             }
             zip.delete()
-            return if (File(dossier, "am").exists()) dossier else null
+            if (!File(temp, "am").exists()) {
+                temp.deleteRecursively()
+                return "Téléchargement incomplet"
+            }
+            dossier.deleteRecursively()
+            if (!temp.renameTo(dossier)) {
+                temp.copyRecursively(dossier, overwrite = true)
+                temp.deleteRecursively()
+            }
+            if (File(dossier, "am").exists()) null else "Téléchargement incomplet"
         } catch (e: Exception) {
-            return null
+            try { zip.delete() } catch (x: Exception) {}
+            temp.deleteRecursively()
+            when (e) {
+                is java.net.UnknownHostException -> "Pas de connexion internet"
+                is java.net.SocketTimeoutException -> "Connexion trop lente, réessaie"
+                is javax.net.ssl.SSLException -> "Connexion sécurisée impossible"
+                is java.io.IOException -> "Erreur réseau : " + (e.message ?: "inconnue")
+                else -> "Erreur : " + (e.message ?: e.javaClass.simpleName)
+            }
         }
     }
 
     private fun demarrerVosk() {
         val dossier = preparerModele()
         if (dossier == null) {
-            majNotif("Modèle indisponible : active internet puis relance Thanos")
+            majNotif("Modèle vocal non installé : $raisonEchec. Active internet puis relance Thanos.")
             charge = false
             return
         }
@@ -218,18 +258,22 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             LibVosk.setLogLevel(LogLevel.WARNINGS)
             model = Model(dossier.absolutePath)
             reconnu = Recognizer(model, 16000.0f)
-            demarrerMicro()
-            majNotif(if (enLigne()) "Dis « Thanos »" else "Dis « Thanos » — hors ligne")
-            handler.post { dire("Thanos est prêt") }
         } catch (e: Exception) {
-            majNotif("Erreur : " + e.message)
+            // Modèle probablement corrompu : on le supprime pour forcer un retéléchargement propre.
+            try { File(filesDir, "model-fr").deleteRecursively() } catch (x: Exception) {}
+            majNotif("Modèle vocal illisible : " + (e.message ?: "erreur") +
+                ". Relance Thanos pour le retélécharger.")
             charge = false
+            return
         }
+        if (!demarrerMicro()) return
+        majNotif(if (enLigne()) "Dis « Thanos »" else "Dis « Thanos » — hors ligne")
+        handler.post { dire("Thanos est prêt") }
     }
 
     // ---------- Micro : gain automatique + suppression du bruit ----------
 
-    private fun demarrerMicro() {
+    private fun demarrerMicro(): Boolean {
         val config = AudioFormat.ENCODING_PCM_16BIT
         val canal = AudioFormat.CHANNEL_IN_MONO
         val taille = maxOf(AudioRecord.getMinBufferSize(16000, canal, config), 8192)
@@ -238,7 +282,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             a.release()
             majNotif("Micro indisponible : vérifie l'autorisation du micro")
             charge = false
-            return
+            return false
         }
         audio = a
         enMarche = true
@@ -268,6 +312,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             try { a.stop() } catch (e: Exception) {}
             a.release()
         }.apply { start() }
+        return true
     }
 
     // Amplification automatique (AGC logiciel) : on vise un niveau sonore constant
