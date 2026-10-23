@@ -53,7 +53,7 @@ import kotlin.math.sqrt
 class ThanosService : Service(), TextToSpeech.OnInitListener {
 
     private enum class Statut { OK, RESEAU, CLE, LIMITE }
-    private data class Rep(val statut: Statut, val texte: String)
+    private data class Rep(val statut: Statut, val texte: String, val recommencer: Boolean = false)
 
     private var model: Model? = null
     private var reconnu: Recognizer? = null
@@ -364,14 +364,21 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
         return d[a.length][b.length]
     }
 
-    // Mot d'activation strict : « Thanos » et ses variantes très proches uniquement.
-    private fun estMotActivation(mot: String): Boolean {
+    // Variantes strictes de « Thanos » : le modèle entend parfois « tanos »,
+    // « danos », « sanos » ou même « anos ».
+    private fun estMotActivationStrict(mot: String): Boolean {
         val s = mot.replace("h", "")
-        if (s == "tanos") return true
-        if (s.length !in 5..6) return false
-        if (!s.startsWith("t") && !s.startsWith("d")) return false
+        if (s.length !in 4..6) return false
         return distance(s, "tanos") <= 1
     }
+
+    // Variantes faibles : le modèle confond aussi « Thanos » avec « annonce »
+    // ou « os ». Ce sont de vrais mots français, on ne les accepte donc qu'en
+    // tout début de phrase pour éviter les déclenchements intempestifs.
+    private val activationsFaibles = setOf("os", "annonce", "anonce")
+
+    private fun estMotActivation(mot: String): Boolean =
+        estMotActivationStrict(mot) || mot in activationsFaibles
 
     private fun traiter(texte: String) {
         val p = norm(texte)
@@ -398,7 +405,10 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             return
         }
         val mots = p.split(" ").filter { it.isNotEmpty() }
-        val idx = mots.indexOfFirst { estMotActivation(it) }
+        var idx = mots.indexOfFirst { estMotActivationStrict(it) }
+        if (idx < 0) {
+            idx = mots.withIndex().firstOrNull { it.index <= 1 && it.value in activationsFaibles }?.index ?: -1
+        }
         if (idx < 0) return
         val reste = mots.drop(idx + 1).joinToString(" ")
         if (reste.isEmpty()) {
@@ -419,6 +429,18 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             return Rep(Statut.CLE, "Il me faut une clé Gemini. Ouvre l'application pour la saisir.")
         }
         if (!enLigne()) return Rep(Statut.RESEAU, messageHorsLigne)
+        var reponse = geminiAppel(cle, prompt, systeme, avecHistorique)
+        var essai = 1
+        while (reponse.recommencer && essai < 2) {
+            essai++
+            majNotif("Gemini met du temps… nouvel essai")
+            try { Thread.sleep(1500) } catch (e: Exception) { break }
+            reponse = geminiAppel(cle, prompt, systeme, avecHistorique)
+        }
+        return reponse
+    }
+
+    private fun geminiAppel(cle: String, prompt: String, systeme: String, avecHistorique: Boolean): Rep {
         try {
             val contenu = JSONArray()
             if (avecHistorique) {
@@ -443,7 +465,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             c.setRequestProperty("Content-Type", "application/json")
             c.setRequestProperty("x-goog-api-key", cle)
             c.connectTimeout = 15000
-            c.readTimeout = 30000
+            c.readTimeout = 45000
             c.doOutput = true
             c.outputStream.use { it.write(corps.toString().toByteArray(Charsets.UTF_8)) }
 
@@ -484,7 +506,13 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                     "Je n'arrive pas à joindre Gemini : " + (e.message ?: "erreur inconnue") +
                     ". Vérifie ta connexion."
             }
-            return Rep(Statut.RESEAU, cause)
+            // Un délai dépassé ou une connexion coupée se répare souvent tout seul :
+            // on demande un second essai. Les erreurs de clé ou de DNS, non.
+            val recommencer = e is java.net.SocketTimeoutException ||
+                (e is java.io.IOException &&
+                    e !is java.net.UnknownHostException &&
+                    e !is javax.net.ssl.SSLException)
+            return Rep(Statut.RESEAU, cause, recommencer)
         }
     }
 
@@ -493,9 +521,14 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             dire(messageHorsLigne)
             return
         }
+        majNotif("Gemini réfléchit…")
         Thread {
             val r = geminiSync(question, personnalite, avecHistorique = true)
-            handler.post { dire(r.texte) }
+            handler.post {
+                // En cas d'échec, on laisse le détail réel du problème dans la notification.
+                if (r.statut == Statut.OK) majNotif(r.texte)
+                dire(r.texte)
+            }
         }.start()
     }
 
@@ -685,21 +718,24 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             } catch (e: Exception) {
             }
             dire("Je ferme $nom")
-            handler.postDelayed({
-                if (ThanosAccessibility.cliquerForceArret()) {
+            // Trois essais espacés : la page des informations met parfois du temps
+            // à s'afficher, et certains téléphones ajoutent une boîte de confirmation.
+            val ecart = intArrayOf(1400, 1000, 1200)
+            fun tenter(essai: Int) {
+                val ok = ThanosAccessibility.cliquerForceArret() ||
+                    (essai > 0 && ThanosAccessibility.cliquerConfirmation())
+                if (ok) {
                     majNotif("$nom est fermé")
                     handler.postDelayed({ allerAccueilSilencieux() }, 600)
+                } else if (essai < ecart.size - 1) {
+                    handler.postDelayed({ tenter(essai + 1) }, ecart[essai + 1].toLong())
                 } else {
-                    // Certains téléphones affichent la page un peu lentement : on réessaie.
-                    handler.postDelayed({
-                        val ok = ThanosAccessibility.cliquerForceArret()
-                        majNotif(
-                            if (ok) "$nom est fermé"
-                            else "Touche « Forcer l'arrêt » pour fermer $nom")
-                        if (ok) handler.postDelayed({ allerAccueilSilencieux() }, 600)
-                    }, 800)
+                    majNotif("Touche « Forcer l'arrêt » pour fermer $nom")
+                    dire("Je n'ai pas réussi à cliquer sur « Forcer l'arrêt ». " +
+                        "La page est ouverte, touche-le toi-même.")
                 }
-            }, 1400)
+            }
+            handler.postDelayed({ tenter(0) }, ecart[0].toLong())
         } else {
             dire("Ouvre les informations de $nom et touche Forcer l'arrêt. " +
                 "Tu peux aussi activer la fermeture automatique dans l'application.")
