@@ -57,6 +57,8 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
 
     private var model: Model? = null
     private var reconnu: Recognizer? = null
+    private var modeleArabe: Model? = null
+    private var reconnuArabe: Recognizer? = null
     private var audio: AudioRecord? = null
     private var ecoute: Thread? = null
     private lateinit var tts: TextToSpeech
@@ -81,7 +83,9 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
         "Ton style est celui de Jarvis dans Iron Man : poli, dévoué, calme et légèrement pince-sans-rire. " +
         "Tu tutoies l'utilisatrice. Tes réponses sont lues à voix haute : écris une à trois phrases courtes, " +
         "sans markdown, sans listes, sans émojis. " +
-        "Si on te demande une information très récente que tu ne peux pas vérifier, dis-le honnêtement."
+        "Si on te demande une information très récente que tu ne peux pas vérifier, dis-le honnêtement. " +
+        "Si l'utilisateur parle en arabe algérien (darija) ou écrit en lettres arabes, " +
+        "réponds en darija algérienne, naturelle et courte."
 
     private val messageHorsLigne =
         "Je suis hors connexion internet. Je peux te donner l'heure et la date, le niveau de batterie, " +
@@ -92,6 +96,11 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private val rxSms = Regex("\\b(?:envoie|ecris|envoyer)\\s+(?:un\\s+)?(?:sms|texto|message)\\s+a\\s+(.+)$")
     private val rxHeure = Regex("\\b(\\d{1,2})\\s*h\\s*(\\d{0,2})\\b")
     private var raisonEchec = "Pas de connexion internet"
+    private val urlModeleFr = "https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip"
+    private val urlModeleAr = "https://alphacephei.com/vosk/models/vosk-model-small-ar-tn-0.1-linto.zip"
+    // Modèle Gemini le plus rapide ; s'il est indisponible pour la clé,
+    // on bascule automatiquement sur l'alias générique.
+    private var modeleGemini = "gemini-3.5-flash-lite"
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -178,13 +187,13 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
 
     // ---------- Modèle Vosk ----------
 
-    private fun preparerModele(): File? {
-        val dossier = File(filesDir, "model-fr")
+    private fun preparerModele(nom: String, libelle: String, url: String): File? {
+        val dossier = File(filesDir, nom)
         if (File(dossier, "am").exists()) return dossier
         var raison: String? = raisonEchec
         for (essai in 1..3) {
-            majNotif("Téléchargement du modèle français (essai $essai/3)...")
-            raison = telechargerModele(dossier)
+            majNotif("Téléchargement du modèle $libelle (essai $essai/3)...")
+            raison = telechargerModele(dossier, url)
             if (raison == null) return dossier
             try { Thread.sleep(2000) } catch (e: Exception) { break }
         }
@@ -193,12 +202,11 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     }
 
     // Retourne null en cas de succès, sinon la raison de l'échec.
-    private fun telechargerModele(dossier: File): String? {
+    private fun telechargerModele(dossier: File, url: String): String? {
         val zip = File(cacheDir, "model.zip")
-        val temp = File(filesDir, "model-fr.tmp")
+        val temp = File(filesDir, dossier.name + ".tmp")
         return try {
-            val c = URL("https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip")
-                .openConnection() as HttpURLConnection
+            val c = URL(url).openConnection() as HttpURLConnection
             c.connectTimeout = 20000
             c.readTimeout = 60000
             val code = c.responseCode
@@ -254,7 +262,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun demarrerVosk() {
-        val dossier = preparerModele()
+        val dossier = preparerModele("model-fr", "français", urlModeleFr)
         if (dossier == null) {
             majNotif("Modèle vocal non installé : $raisonEchec. Active internet puis relance Thanos.")
             charge = false
@@ -272,9 +280,25 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             charge = false
             return
         }
+        if (getSharedPreferences("thanos", MODE_PRIVATE).getBoolean("arabe", false)) chargerModeleArabe()
         if (!demarrerMicro()) return
-        majNotif(if (enLigne()) "Dis « Thanos »" else "Dis « Thanos » — hors ligne")
+        majNotif(
+            (if (enLigne()) "Dis « Thanos »" else "Dis « Thanos » — hors ligne") +
+                (if (reconnuArabe != null) " — arabe actif" else ""))
         handler.post { dire("Thanos est prêt") }
+    }
+
+    // Modèle arabe (darija maghrébine) : optionnel, activé depuis l'application.
+    private fun chargerModeleArabe() {
+        val dossier = preparerModele("model-ar", "arabe (darija)", urlModeleAr) ?: return
+        try {
+            modeleArabe = Model(dossier.absolutePath)
+            reconnuArabe = Recognizer(modeleArabe, 16000.0f)
+        } catch (e: Exception) {
+            // Modèle probablement corrompu : suppression pour un retéléchargement propre.
+            try { File(filesDir, "model-ar").deleteRecursively() } catch (x: Exception) {}
+            majNotif("Modèle arabe illisible : arrête puis relance Thanos pour le retélécharger.")
+        }
     }
 
     // ---------- Micro : gain automatique + suppression du bruit ----------
@@ -306,8 +330,18 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
                     .asShortBuffer().put(tampon, 0, n)
                 val fin = r.acceptWaveForm(data, data.size)
-                if (fin) {
-                    val texte = JSONObject(r.getResult()).optString("text")
+                val ra = reconnuArabe
+                val finAr = ra?.acceptWaveForm(data, data.size) == true
+                if (fin || finAr) {
+                    val arabe = if (finAr && ra != null) {
+                        JSONObject(ra.getResult()).optString("text")
+                    } else ""
+                    val francais = if (fin) {
+                        JSONObject(r.getResult()).optString("text")
+                    } else ""
+                    // Le texte arabe prime : sur une phrase en darija, le modèle
+                    // français ne crache souvent que du bruit.
+                    val texte = if (arabe.isNotBlank()) arabe else francais
                     if (texte.isNotBlank()) handler.post { traiter(texte) }
                 } else if (attendCommande && compteur % 4 == 0) {
                     val partiel = JSONObject(r.getPartialResult()).optString("partial")
@@ -346,7 +380,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
     private fun norm(s: String): String {
         val d = Normalizer.normalize(s.lowercase(Locale.FRANCE), Normalizer.Form.NFD)
         return d.replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
-            .replace(Regex("[^a-z0-9 ]"), " ")
+            .replace(Regex("[^a-z0-9 \\u0600-\\u06FF]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
     }
@@ -406,9 +440,10 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
         }
         val mots = p.split(" ").filter { it.isNotEmpty() }
         var idx = mots.indexOfFirst { estMotActivationStrict(it) }
-        if (idx < 0) {
-            idx = mots.withIndex().firstOrNull { it.index <= 1 && it.value in activationsFaibles }?.index ?: -1
-        }
+        // Mot d'activation en arabe : « Thanos » écrit en lettres arabes.
+        if (idx < 0) idx = mots.indexOfFirst { it.contains("ثانوس") || it.contains("تانوس") }
+        // Variantes faibles : uniquement seules ou en tête d'une très courte phrase.
+        if (idx < 0 && mots.size <= 3) idx = mots.indexOfFirst { it in activationsFaibles }
         if (idx < 0) return
         val reste = mots.drop(idx + 1).joinToString(" ")
         if (reste.isEmpty()) {
@@ -429,18 +464,25 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             return Rep(Statut.CLE, "Il me faut une clé Gemini. Ouvre l'application pour la saisir.")
         }
         if (!enLigne()) return Rep(Statut.RESEAU, messageHorsLigne)
-        var reponse = geminiAppel(cle, prompt, systeme, avecHistorique)
+        var reponse = geminiAppel(cle, prompt, systeme, avecHistorique, modeleGemini)
+        if (reponse.texte.contains("erreur 404")) {
+            // Modèle indisponible pour cette clé : on bascule sur l'alias générique.
+            modeleGemini = "gemini-flash-latest"
+            reponse = geminiAppel(cle, prompt, systeme, avecHistorique, modeleGemini)
+        }
         var essai = 1
         while (reponse.recommencer && essai < 2) {
             essai++
             majNotif("Gemini met du temps… nouvel essai")
             try { Thread.sleep(1500) } catch (e: Exception) { break }
-            reponse = geminiAppel(cle, prompt, systeme, avecHistorique)
+            reponse = geminiAppel(cle, prompt, systeme, avecHistorique, modeleGemini)
         }
         return reponse
     }
 
-    private fun geminiAppel(cle: String, prompt: String, systeme: String, avecHistorique: Boolean): Rep {
+    private fun geminiAppel(
+        cle: String, prompt: String, systeme: String, avecHistorique: Boolean, modele: String
+    ): Rep {
         try {
             val contenu = JSONArray()
             if (avecHistorique) {
@@ -459,7 +501,7 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 .put("contents", contenu)
                 .put("generationConfig", JSONObject().put("maxOutputTokens", 1000))
 
-            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
+            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$modele:generateContent")
                 .openConnection() as HttpURLConnection
             c.requestMethod = "POST"
             c.setRequestProperty("Content-Type", "application/json")
@@ -490,6 +532,10 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             return when (code) {
                 429 -> Rep(Statut.LIMITE, "J'ai atteint ma limite gratuite. Réessaie dans une minute.")
                 400, 401, 403 -> Rep(Statut.CLE, "Ta clé Gemini semble invalide. Vérifie-la dans l'application.")
+                500, 502, 503, 504 -> Rep(
+                    Statut.RESEAU,
+                    "Gemini est momentanément saturé. Réessaie dans un instant.",
+                    recommencer = true)
                 else -> Rep(Statut.CLE, "Gemini a renvoyé l'erreur $code.")
             }
         } catch (e: Exception) {
@@ -660,8 +706,17 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
 
     // ---------- Actions ----------
 
+    private var langueVocale = Locale.FRANCE
+
     private fun dire(m: String) {
-        if (ttsPret) tts.speak(m, TextToSpeech.QUEUE_FLUSH, null, "thanos")
+        if (!ttsPret) return
+        // Réponse en arabe/darija : on bascule la synthèse vocale en arabe.
+        val loc = if (m.any { it in '\u0600'..'\u06FF' }) Locale("ar") else Locale.FRANCE
+        if (loc != langueVocale) {
+            tts.language = loc
+            langueVocale = loc
+        }
+        tts.speak(m, TextToSpeech.QUEUE_FLUSH, null, "thanos")
     }
 
     private fun lancer(intent: Intent, titre: String, avecNotif: Boolean = true) {
@@ -718,24 +773,27 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
             } catch (e: Exception) {
             }
             dire("Je ferme $nom")
-            // Trois essais espacés : la page des informations met parfois du temps
-            // à s'afficher, et certains téléphones ajoutent une boîte de confirmation.
-            val ecart = intArrayOf(1400, 1000, 1200)
-            fun tenter(essai: Int) {
-                val ok = ThanosAccessibility.cliquerForceArret() ||
-                    (essai > 0 && ThanosAccessibility.cliquerConfirmation())
-                if (ok) {
-                    majNotif("$nom est fermé")
-                    handler.postDelayed({ allerAccueilSilencieux() }, 600)
-                } else if (essai < ecart.size - 1) {
-                    handler.postDelayed({ tenter(essai + 1) }, ecart[essai + 1].toLong())
-                } else {
-                    majNotif("Touche « Forcer l'arrêt » pour fermer $nom")
-                    dire("Je n'ai pas réussi à cliquer sur « Forcer l'arrêt ». " +
-                        "La page est ouverte, touche-le toi-même.")
+            // On clique dès que la page apparaît, puis on revient tout de suite
+            // à l'accueil : les paramètres ne font plus qu'un bref passage à l'écran.
+            var essais = 0
+            val tenter = object : Runnable {
+                override fun run() {
+                    essais++
+                    val ok = ThanosAccessibility.cliquerForceArret() ||
+                        (essais >= 3 && ThanosAccessibility.cliquerConfirmation())
+                    if (ok) {
+                        majNotif("$nom est fermé")
+                        handler.postDelayed({ allerAccueilSilencieux() }, 400)
+                    } else if (essais < 9) {
+                        handler.postDelayed(this, 300)
+                    } else {
+                        majNotif("Touche « Forcer l'arrêt » pour fermer $nom")
+                        dire("Je n'ai pas réussi à cliquer sur « Forcer l'arrêt ». " +
+                            "La page est ouverte, touche-le toi-même.")
+                    }
                 }
             }
-            handler.postDelayed({ tenter(0) }, ecart[0].toLong())
+            handler.postDelayed(tenter, 400)
         } else {
             dire("Ouvre les informations de $nom et touche Forcer l'arrêt. " +
                 "Tu peux aussi activer la fermeture automatique dans l'application.")
@@ -870,6 +928,20 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
                 }
             }
 
+            p.startsWith("cherche ") || p.startsWith("recherche ") || p.startsWith("trouve ") -> {
+                val requete = p.substringAfter(" ")
+                    .removeSuffix(" sur google").removeSuffix(" sur internet").trim()
+                if (requete.isEmpty()) {
+                    dire("Que veux-tu que je cherche ?")
+                } else {
+                    dire("Je cherche $requete sur Google")
+                    lancer(
+                        Intent(Intent.ACTION_VIEW,
+                            Uri.parse("https://www.google.com/search?q=" + Uri.encode(requete))),
+                        "la recherche Google")
+                }
+            }
+
             p.startsWith("ouvre ") -> {
                 val nom = p.removePrefix("ouvre ").trim()
                 val pkg = trouverAppli(nom)
@@ -947,7 +1019,9 @@ class ThanosService : Service(), TextToSpeech.OnInitListener {
         try { ecoute?.join(500) } catch (e: Exception) {}
         try { audio?.release() } catch (e: Exception) {}
         try { reconnu?.close() } catch (e: Exception) {}
+        try { reconnuArabe?.close() } catch (e: Exception) {}
         try { model?.close() } catch (e: Exception) {}
+        try { modeleArabe?.close() } catch (e: Exception) {}
         tts.shutdown()
         super.onDestroy()
     }

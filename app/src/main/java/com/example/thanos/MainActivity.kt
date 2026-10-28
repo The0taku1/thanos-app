@@ -57,6 +57,25 @@ class MainActivity : ComponentActivity() {
                     "pour pouvoir fermer des applis à la voix."
             }
         }
+        val arabe = Button(this).apply {
+            fun majTexte() {
+                text = if (prefs.getBoolean("arabe", false))
+                    "🌍 Arabe / darija : ACTIF (re-touche pour couper)"
+                else
+                    "🌍 Activer l'arabe / darija (160 Mo)"
+            }
+            majTexte()
+            setOnClickListener {
+                val nouveau = !prefs.getBoolean("arabe", false)
+                prefs.edit().putBoolean("arabe", nouveau).apply()
+                majTexte()
+                texte.text = if (nouveau)
+                    "Arabe/darija activé. Arrête puis relance Thanos : il téléchargera le " +
+                    "modèle vocal arabe (160 Mo, une seule fois)."
+                else
+                    "Arabe/darija désactivé. Arrête puis relance Thanos."
+            }
+        }
         val champCle = EditText(this).apply {
             hint = "Colle ta clé Gemini ici"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -79,6 +98,7 @@ class MainActivity : ComponentActivity() {
             addView(arreter)
             addView(reglages)
             addView(accessibilite)
+            addView(arabe)
             addView(champCle)
             addView(enregistrer)
         }
